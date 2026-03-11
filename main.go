@@ -8,8 +8,9 @@ import (
 )
 
 type Client struct {
-	Username string
-	conn     net.Conn
+	Username  string
+	SendQueue chan []byte
+	Conn      net.Conn
 }
 
 type Message struct {
@@ -18,13 +19,15 @@ type Message struct {
 }
 
 const (
-	Port              = "6060"
-	BufferSize        = 512
-	MessageBufferSize = 10
+	Port                  = "6060"
+	BufferSize            = 512
+	MessageBufferSize     = 1024
+	MsgQueueSizePerClient = 5
 )
 
 var (
 	clients      map[string]Client = map[string]Client{}
+	messages     chan Message      = make(chan Message, MessageBufferSize)
 	invalidChars *regexp.Regexp    = regexp.MustCompile("[^A-Za-z0-9_]")
 	crlf         *regexp.Regexp    = regexp.MustCompile("[\r\n]+$")
 )
@@ -61,17 +64,14 @@ func identifyClient(conn net.Conn) (Client, error) {
 					chosenUsername))
 			continue
 		}
-		clients[chosenUsername] = Client{
+		client := Client{
 			chosenUsername,
+			make(chan []byte, MsgQueueSizePerClient),
 			conn,
 		}
-		return clients[chosenUsername], nil
+		clients[chosenUsername] = client
+		return client, nil
 	}
-}
-
-func handleClientDisconnect(client Client) {
-	delete(clients, client.Username)
-	client.conn.Close()
 }
 
 func handleConn(conn net.Conn, messages chan<- Message) {
@@ -83,9 +83,10 @@ func handleConn(conn net.Conn, messages chan<- Message) {
 		conn.Close()
 		return
 	}
+	go clientWriter(client)
 
 	fmt.Printf("INFO: %v: Client connected\n", client.Username)
-	client.conn.Write(
+	client.Conn.Write(
 		fmt.Appendf([]byte(""),
 			"Hello, %s. You can chat now",
 			client.Username))
@@ -93,12 +94,7 @@ func handleConn(conn net.Conn, messages chan<- Message) {
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			messages <- Message{
-				client.Username,
-				[]byte("has disconnected"),
-			}
 			handleClientDisconnect(client)
-			fmt.Printf("INFO: %v: Client Disconnected\n", client.Username)
 			return
 		}
 
@@ -109,12 +105,34 @@ func handleConn(conn net.Conn, messages chan<- Message) {
 	}
 }
 
+func clientWriter(client Client) {
+	for msg := range client.SendQueue {
+		client.Conn.Write(msg)
+	}
+}
+
+func handleClientDisconnect(client Client) {
+	messages <- Message{
+		client.Username,
+		[]byte("has disconnected"),
+	}
+	delete(clients, client.Username)
+	client.Conn.Close()
+	fmt.Printf("INFO: %v: Client Disconnected\n", client.Username)
+}
+
 func handleMessages(messages <-chan Message) {
 	for message := range messages {
 		messageBytes := fmt.Appendf([]byte(""), "%s: %s", message.Author, message.Text)
 		for _, client := range clients {
-			if client.Username != message.Author {
-				client.conn.Write(messageBytes)
+			if client.Username == message.Author {
+				continue
+			}
+
+			select {
+			case client.SendQueue <- messageBytes:
+			default:
+				handleClientDisconnect(client)
 			}
 		}
 	}
@@ -129,7 +147,6 @@ func main() {
 	}
 	fmt.Printf("INFO: Chat server started on %s\n", address)
 
-	messages := make(chan Message, MessageBufferSize)
 	go handleMessages(messages)
 	for {
 		conn, err := lis.Accept()

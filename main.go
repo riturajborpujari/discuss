@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"sync"
 )
 
 type Client struct {
@@ -27,6 +28,7 @@ const (
 
 var (
 	clients      map[string]Client = map[string]Client{}
+	clientsMu	 sync.RWMutex      = sync.RWMutex{}
 	messages     chan Message      = make(chan Message, MessageBufferSize)
 	invalidChars *regexp.Regexp    = regexp.MustCompile("[^A-Za-z0-9_]")
 	crlf         *regexp.Regexp    = regexp.MustCompile("[\r\n]+$")
@@ -69,6 +71,8 @@ func identifyClient(conn net.Conn) (Client, error) {
 			make(chan []byte, MsgQueueSizePerClient),
 			conn,
 		}
+		clientsMu.Lock()
+		defer clientsMu.Unlock()
 		clients[chosenUsername] = client
 		return client, nil
 	}
@@ -112,11 +116,14 @@ func clientWriter(client Client) {
 }
 
 func handleClientDisconnect(client Client) {
+	clientsMu.Lock()
 	messages <- Message{
 		client.Username,
 		[]byte("has disconnected"),
 	}
 	delete(clients, client.Username)
+	clientsMu.Unlock()
+	close(client.SendQueue)
 	client.Conn.Close()
 	fmt.Printf("INFO: %v: Client Disconnected\n", client.Username)
 }
@@ -124,7 +131,15 @@ func handleClientDisconnect(client Client) {
 func handleMessages(messages <-chan Message) {
 	for message := range messages {
 		messageBytes := fmt.Appendf([]byte(""), "%s: %s", message.Author, message.Text)
+
+		clientList := make([]*Client, 0, len(clients))
+		clientsMu.RLock()
 		for _, client := range clients {
+			clientList = append(clientList, &client)
+		}
+		clientsMu.RUnlock()
+
+		for _, client := range clientList {
 			if client.Username == message.Author {
 				continue
 			}
@@ -132,7 +147,7 @@ func handleMessages(messages <-chan Message) {
 			select {
 			case client.SendQueue <- messageBytes:
 			default:
-				handleClientDisconnect(client)
+				handleClientDisconnect(*client)
 			}
 		}
 	}

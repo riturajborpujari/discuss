@@ -116,16 +116,19 @@ func clientWriter(client Client) {
 }
 
 func handleClientDisconnect(client Client) {
-	clientsMu.Lock()
-	messages <- Message{
-		client.Username,
-		[]byte("has disconnected"),
-	}
-	delete(clients, client.Username)
-	clientsMu.Unlock()
-	close(client.SendQueue)
-	client.Conn.Close()
-	fmt.Printf("INFO: %v: Client Disconnected\n", client.Username)
+	once := sync.Once{}
+	once.Do(func () {
+		clientsMu.Lock()
+		messages <- Message{
+			client.Username,
+			[]byte("has disconnected"),
+		}
+		delete(clients, client.Username)
+		clientsMu.Unlock()
+		close(client.SendQueue)
+		client.Conn.Close()
+		fmt.Printf("INFO: %v: Client Disconnected\n", client.Username)
+	})
 }
 
 func handleMessages(messages <-chan Message) {
